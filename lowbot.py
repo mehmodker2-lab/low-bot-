@@ -1,4 +1,4 @@
-﻿import telebot
+import telebot
 from telebot import types, apihelper
 import sqlite3
 try:
