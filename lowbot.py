@@ -600,6 +600,17 @@ class DatabaseManager:
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_sent_channel_msg ON sent_messages(channel_id, message_id)')
         else:
             cursor.execute("ALTER TABLE sent_messages ADD COLUMN IF NOT EXISTS deleted_by TEXT")
+            # chat_id قد يكون معرفاً رقمياً أو يوزرنيم قناة (@name) — لذا يجب أن يكون TEXT.
+            cursor.execute(
+                """SELECT data_type FROM information_schema.columns
+                   WHERE table_name = 'sent_messages' AND column_name = 'chat_id'"""
+            )
+            _type_row = cursor.fetchone()
+            if _type_row and str(_type_row[0]).lower() in ('bigint', 'integer', 'smallint'):
+                cursor.execute(
+                    "ALTER TABLE sent_messages ALTER COLUMN chat_id TYPE TEXT USING chat_id::text"
+                )
+                logger.info("🛠️ تم تحويل sent_messages.chat_id إلى TEXT لقبول يوزرنيمات القنوات")
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_sent_channel_msg ON sent_messages(channel_id, message_id)')
         conn.commit()
 
@@ -624,7 +635,7 @@ class DatabaseManager:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             message_id INTEGER,
             channel_id TEXT,
-            chat_id INTEGER,
+            chat_id TEXT,
             message_type TEXT,
             timestamp INTEGER,
             content TEXT,
@@ -740,7 +751,7 @@ class DatabaseManager:
             id SERIAL PRIMARY KEY,
             message_id BIGINT,
             channel_id TEXT,
-            chat_id BIGINT,
+            chat_id TEXT,
             message_type TEXT,
             timestamp BIGINT,
             content TEXT,
@@ -1359,7 +1370,8 @@ class DatabaseManager:
         return self.execute_query(
             '''INSERT INTO sent_messages (message_id, channel_id, chat_id, message_type, content, batch_id, timestamp)
             VALUES (%s, %s, %s, %s, %s, %s, %s)''',
-            (message_id, channel_id, chat_id, message_type, content, batch_id, now_epoch)
+            (message_id, channel_id, str(chat_id) if chat_id is not None else None,
+             message_type, content, batch_id, now_epoch)
         )
 
     def new_broadcast_batch_id(self) -> int:
