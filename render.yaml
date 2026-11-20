@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: low-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn lowbot:app --workers 1 --threads 8 --timeout 180 --graceful-timeout 30
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      # 🔐 تُضبط من لوحة Render (لا تُكتب في المستودع)
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      # 🐘 رابط Supabase Pooler (منفذ 6543)
+      - key: DATABASE_URL
+        sync: false
+      - key: INSTANCE_ID
+        value: low-main
+      - key: RUN_BOT
+        value: "1"

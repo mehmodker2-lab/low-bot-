@@ -1,14 +1,18 @@
 import telebot
-from telebot import types, apihelper
+from telebot import types, apihelper, ExceptionHandler
 import sqlite3
 try:
     import psycopg2
     from psycopg2 import IntegrityError as PgIntegrityError
+    from psycopg2 import pool as pg_pool
     HAS_PSYCOPG2 = True
 except ImportError:
     HAS_PSYCOPG2 = False
     PgIntegrityError = Exception
+    pg_pool = None
 import re
+import json
+import hashlib
 import logging
 import os
 import time
@@ -17,6 +21,7 @@ import threading
 import warnings
 from datetime import datetime, timedelta
 from typing import List, Tuple
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 try:
     from flask import Flask
     app = Flask(__name__)
@@ -24,6 +29,25 @@ try:
     @app.route('/')
     def home():
         return "Bot is active and running 24/7!", 200
+
+    @app.route('/healthz')
+    def healthz():
+        """فحص سريع للتأكد من أن قاعدة البيانات السحابية هي المستخدمة فعلاً (لا تُفقد البيانات)."""
+        info = {"ok": True}
+        try:
+            info["db_engine"] = "postgresql" if not db.is_sqlite else "sqlite"
+            info["db_path"] = None if not db.is_sqlite else db.db_name
+            info["instance"] = INSTANCE_ID
+            info["persistent"] = (not db.is_sqlite)
+            for table in ("channels", "admins", "listing_requests",
+                          "sent_messages", "pending_messages", "scheduled_deletions"):
+                rows = db.execute_query(f'SELECT COUNT(*) FROM {table}', fetch=True)
+                info[table] = rows[0][0] if rows else None
+        except Exception as e:
+            info["ok"] = False
+            info["error"] = str(e)
+        return json.dumps(info, ensure_ascii=False), (200 if info["ok"] else 500), {'Content-Type': 'application/json'}
+
     HAS_FLASK = True
 except ImportError:
     HAS_FLASK = False
@@ -69,15 +93,144 @@ apihelper.CONNECT_TIMEOUT = 20
 apihelper.READ_TIMEOUT = 60
 apihelper.RETRY_ON_ERROR = True
 
-# استبدل بالتوكن الخاص بك
-TOKEN = '8227408793:AAGl5b_azWRuI8J27h6a8mc_AUwi-v9xc4w'
-ADMIN_ID = 5945226339  # غيره إلى معرفك الحقيقي
+# ─────────────────────────────────────────────────────────────
+# ⚙️ الإعدادات الأساسية (متغيرات البيئة أولاً حتى تصلح لعدة نسخ)
+# ─────────────────────────────────────────────────────────────
+def _env(*names, default=None):
+    """إرجاع أول متغير بيئة موجود وغير فارغ."""
+    for _n in names:
+        _v = os.environ.get(_n)
+        if _v is not None and str(_v).strip() != "":
+            return str(_v).strip()
+    return default
 
-# تهيئة البوت
-bot = telebot.TeleBot(TOKEN)
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(str(_env(name, default=str(default))).strip())
+    except Exception:
+        return default
+
+
+# التوكن ومعرف الأونر: تُقرأ من متغيرات البيئة على الاستضافة (BOT_TOKEN / ADMIN_ID)
+# القيم المكتوبة هنا مجرد احتياط للتشغيل المحلي فقط — لا ترفع التوكن الحقيقي إلى GitHub.
+TOKEN = _env('BOT_TOKEN', 'TELEGRAM_BOT_TOKEN', 'BOT_API_TOKEN',
+             default='8227408793:AAGl5b_azWRuI8J27h6a8mc_AUwi-v9xc4w')
+ADMIN_ID = _env_int('ADMIN_ID', _env_int('OWNER_ID', 5945226339))
+
+# معرّف النسخة (مفيد عند تشغيل أكثر من نسخة/بوت على نفس القاعدة)
+INSTANCE_ID = _env('INSTANCE_ID', 'BOT_NAME', default=f"bot-{ADMIN_ID}")
+
 # رابط اتصال Supabase PostgreSQL
 DATABASE_URL = os.environ.get('DATABASE_URL', '')
 BOT_USERNAME = None
+
+# إعدادات الرادار (كشف الحذف المبكر)
+RADAR_GRACE_SECONDS = _env_int('RADAR_GRACE_SECONDS', 90)      # تجاهل المنشورات الأحدث من هذه المدة
+RADAR_EVERY_N_CYCLES = max(1, _env_int('RADAR_EVERY_N_CYCLES', 2))  # كل كم دورة فحص (15 ثانية للدورة)
+SUPPRESSION_RETENTION_DAYS = _env_int('SUPPRESSION_RETENTION_DAYS', 7)
+
+# قفل يمنع تداخل الحذف اليدوي مع رادار كشف الغش (سبب التحذيرات الكاذبة)
+DELETION_LOCK = threading.RLock()
+
+# 📵 إشعارات الأخطاء الفنية في الخاص: مغلقة افتراضياً.
+# السبب: البوت يُباع لزبائن، وأي Stack Trace أو رسالة 409 تظهر للأونر/الزبون
+# تبدو كعطل. الأخطاء تبقى في سجلات Render فقط. فعّلها بـ SEND_ERROR_REPORTS=1
+# (ومع ذلك لن تُرسل أخطاء 409/انقطاع الشبكة العابرة إطلاقاً).
+SEND_ERROR_REPORTS = _env('SEND_ERROR_REPORTS', default='0') == '1'
+# مدة صلاحية قفل التشغيل قبل اعتباره مهجوراً (نسخة قديمة ماتت)
+POLLER_LOCK_STALE_SECONDS = max(45, _env_int('POLLER_LOCK_STALE_SECONDS', 90))
+
+
+def _exception_text(exception) -> str:
+    try:
+        return f"{type(exception).__name__}: {exception}".lower()
+    except Exception:
+        return ""
+
+
+def _is_polling_conflict(exception) -> bool:
+    """هل هذا خطأ 409 (نسختان تستقبلان نفس البوت)؟ خطأ عابر لا يجب إزعاج أحد به."""
+    code = getattr(exception, 'error_code', None)
+    if code == 409:
+        return True
+    text = _exception_text(exception)
+    return ('409' in text and 'conflict' in text) or 'terminated by other getupdates' in text
+
+
+def _is_transient_technical_error(exception) -> bool:
+    """أخطاء شبكة/تيليجرام عابرة: تُسجّل فقط ولا تُرسل لأي شخص."""
+    if _is_polling_conflict(exception):
+        return True
+    text = _exception_text(exception)
+    markers = (
+        'read timed out', 'timed out', 'timeout', 'connection', 'connectionreseterror',
+        'connection aborted', 'connection refused', 'remote end closed', 'bad gateway',
+        'service unavailable', 'temporarily unavailable', 'getupdates', 'webhook',
+        'too many requests', 'retry after', 'network is unreachable', 'name resolution',
+    )
+    return any(m in text for m in markers)
+
+
+class AdminErrorNotifier(ExceptionHandler):
+    """
+    معالج الأخطاء العام للبوت.
+
+    السلوك الافتراضي (SEND_ERROR_REPORTS=0):
+      • يُسجّل الخطأ كاملاً في سجلات الاستضافة (Render Logs) للمطوّر.
+      • لا يُرسل أي شيء إلى الخاص (لا Stack Trace ولا رسائل تقنية) حتى لا تظهر
+        أعطال للزبائن عند بيع البوت.
+
+    عند SEND_ERROR_REPORTS=1:
+      • تُرسل رسالة عربية قصيرة جداً بلا أي تفاصيل تقنية، ومرة كل ساعة كحد أقصى
+        لنفس نوع الخطأ، حتى لا يتحول الخاص إلى سجل أخطاء.
+    """
+
+    #: حماية من الإغراق: نوع الخطأ → آخر وقت أُرسل فيه إشعار
+    _last_report_at = {}
+    #: آخر مرة سُجّل فيها تحذير 409 في السجل (نكتبه مرة كل دقيقة فقط)
+    _last_conflict_log_at = 0.0
+
+    def handle(self, exception):
+        # أخطاء 409 والشبكة: سطر واحد في السجل فقط (بلا Traceback ولا رسالة خاصة)
+        if _is_polling_conflict(exception):
+            now = time.time()
+            if now - AdminErrorNotifier._last_conflict_log_at >= 60:
+                AdminErrorNotifier._last_conflict_log_at = now
+                logger.warning(
+                    "↻ تعارض استقبال 409: نسخة أخرى من نفس البوت تعمل الآن. "
+                    "أوقف/احذف الخدمة القديمة على Render (أو أي جهاز آخر يشغّل نفس التوكن). "
+                    "لن يُرسل أي إشعار للخاص."
+                )
+            return True
+        if _is_transient_technical_error(exception):
+            logger.warning(f"↻ خطأ شبكة عابر — تجاهل صامت: {exception}")
+            return True
+
+        # أي خطأ آخر يُسجّل كاملاً للمطوّر في سجلات الاستضافة
+        logger.error(f"خطأ في معالج: {exception}", exc_info=True)
+
+        if not SEND_ERROR_REPORTS:
+            return True
+
+        try:
+            kind = type(exception).__name__
+            now = time.time()
+            if now - self._last_report_at.get(kind, 0) < 3600:
+                return True
+            self._last_report_at[kind] = now
+            bot.send_message(
+                ADMIN_ID,
+                "⚠️ حدث خطأ داخلي غير متوقع وتم تسجيله في سجلات الخادم.\n"
+                "✅ البوت يعمل، ولا حاجة لأي إجراء منك.",
+                parse_mode=None
+            )
+        except Exception as send_err:
+            logger.error(f"فشل إرسال إشعار الخطأ للمشرف: {send_err}")
+        return True
+
+
+bot = telebot.TeleBot(TOKEN, exception_handler=AdminErrorNotifier())
 
 DAYS_AR = {
     0: "الإثنين",
@@ -128,8 +281,58 @@ USER_RULES_TEXT = (
     "👨‍💻 <b>إدارة المنصة:</b> @NEXUS_IMTIAZ"
 )
 
+class _PooledConnection:
+    """
+    غلاف بسيط حول اتصال psycopg2 مأخوذ من الـ pool.
+    يسمح للكود القديم بمناداة conn.close() وحينها يُعاد الاتصال إلى الـ pool
+    بدل إغلاقه فعلياً (أسرع بكثير مع Supabase + لا يستهلك اتصالات لا نهائية).
+    """
+
+    __slots__ = ('_manager', '_conn', '_released')
+
+    def __init__(self, manager, conn):
+        object.__setattr__(self, '_manager', manager)
+        object.__setattr__(self, '_conn', conn)
+        object.__setattr__(self, '_released', False)
+
+    def __getattr__(self, item):
+        return getattr(object.__getattribute__(self, '_conn'), item)
+
+    def _release(self, close: bool):
+        if object.__getattribute__(self, '_released'):
+            return
+        object.__setattr__(self, '_released', True)
+        manager = object.__getattribute__(self, '_manager')
+        conn = object.__getattribute__(self, '_conn')
+        try:
+            manager._pg_pool.putconn(conn, close=close)
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def discard(self):
+        """التخلص من الاتصال نهائياً (يُستخدم عند انقطاع الاتصال بالسيرفر)."""
+        self._release(close=True)
+
+    def close(self):
+        """إعادة الاتصال إلى الـ pool مع تصفير حالته."""
+        if object.__getattribute__(self, '_released'):
+            return
+        try:
+            self._conn.rollback()
+        except Exception:
+            self._release(close=True)
+            return
+        self._release(close=False)
+
+
 class DatabaseManager:
     """مدير قاعدة البيانات - يدعم تلقائياً SQLite محلياً و PostgreSQL سحابياً (Supabase)"""
+
+    #: كل استعلام يُعاد تلقائياً عند أخطاء الشبكة العابرة (Supabase يقطع الاتصالات الخاملة)
+    RETRY_ON_DB_ERROR = 3
 
     @staticmethod
     def adapt_query(query: str) -> str:
@@ -138,122 +341,267 @@ class DatabaseManager:
         q = q.replace('EXCLUDED.', 'excluded.')
         return q
 
-    def __init__(self):
-        db_url = os.environ.get('DATABASE_URL') or os.environ.get('SUPABASE_DB_URL') or os.environ.get('POSTGRES_URL') or DATABASE_URL
-        db_url = (db_url or '').strip()
-        if db_url.startswith("postgres://"):
-            db_url = db_url.replace("postgres://", "postgresql://", 1)
+    @staticmethod
+    def normalize_pg_url(url: str) -> str:
+        """تنظيف رابط Postgres وإجبار sslmode/keepalive (شرط أساسي مع Supabase)."""
+        url = (url or "").strip().strip('"').strip("'")
+        if not url:
+            return ""
+        if url.startswith("postgres://"):
+            url = "postgresql://" + url[len("postgres://"):]
+        try:
+            parts = urlsplit(url)
+            if not parts.scheme.startswith("postgres"):
+                return url
+            query = dict(parse_qsl(parts.query, keep_blank_values=True))
+            host = (parts.hostname or "").lower()
+            if "supabase" in host:
+                query.setdefault("sslmode", "require")
+            query.setdefault("connect_timeout", "15")
+            query.setdefault("keepalives", "1")
+            query.setdefault("keepalives_idle", "30")
+            query.setdefault("application_name", f"bigbot-{INSTANCE_ID}"[:60])
+            return urlunsplit((parts.scheme, parts.netloc, parts.path,
+                               urlencode(query), parts.fragment))
+        except Exception:
+            return url
 
-        self.database_url = db_url
-        if self.database_url and HAS_PSYCOPG2:
-            try:
-                conn_test = psycopg2.connect(self.database_url)
-                conn_test.close()
-                self.is_sqlite = False
-                logger.info("🐘 تم تفعيل والاتصال بنجاح بقاعدة البيانات السحابية PostgreSQL (Supabase / Render).")
-            except Exception as pg_err:
-                logger.error(f"⚠️ فشل الاتصال برابط PostgreSQL ({pg_err})! سيتم استخدام SQLite مؤقتاً.")
-                self.is_sqlite = True
-                script_dir = os.path.dirname(os.path.abspath(__file__))
-                self.db_name = os.path.join(script_dir, 'channels.db')
+    def __init__(self):
+        db_url = (_env('DATABASE_URL', 'SUPABASE_DB_URL', 'POSTGRES_URL', 'POSTGRESQL_URL',
+                       default='') or DATABASE_URL or '')
+        self.database_url = self.normalize_pg_url(db_url)
+        self._pg_pool = None
+        self.is_sqlite = True
+        self.db_name = self._sqlite_path()
+        self.pool_max = max(2, _env_int('DB_POOL_MAX', 10))
+        self.connect_retries = max(1, _env_int('DB_CONNECT_RETRIES', 6))
+
+        if self.database_url:
+            if not HAS_PSYCOPG2:
+                raise RuntimeError(
+                    "تم ضبط DATABASE_URL لكن مكتبة psycopg2-binary غير مُنصّبة. "
+                    "أضفها إلى requirements.txt ثم أعد النشر."
+                )
+            last_err = None
+            for attempt in range(1, self.connect_retries + 1):
+                try:
+                    self._pg_pool = pg_pool.ThreadedConnectionPool(1, self.pool_max, dsn=self.database_url)
+                    probe = self._pg_pool.getconn()
+                    try:
+                        cur = probe.cursor()
+                        cur.execute("SELECT 1")
+                        cur.fetchone()
+                        cur.close()
+                    finally:
+                        self._pg_pool.putconn(probe)
+                    self.is_sqlite = False
+                    logger.info("🐘 تم الاتصال بنجاح بقاعدة البيانات السحابية PostgreSQL (Supabase / Render) — البيانات دائمة ✅")
+                    break
+                except Exception as pg_err:
+                    last_err = pg_err
+                    self._pg_pool = None
+                    logger.error(f"⚠️ محاولة الاتصال بقاعدة البيانات {attempt}/{self.connect_retries} فشلت: {pg_err}")
+                    if attempt < self.connect_retries:
+                        time.sleep(min(8, 2 * attempt))
+
+            if self.is_sqlite:
+                hint = (
+                    "تعذّر الاتصال بقاعدة البيانات السحابية. توقّف التشغيل لتفادي الكتابة في قاعدة مؤقتة تُفقد عند كل إعادة تشغيل.\n"
+                    "💡 تحقّق من DATABASE_URL في متغيرات البيئة على Render، واستعمل رابط Supabase Pooler (منفذ 6543) "
+                    "لأن Render لا يدعم اتصال IPv6 المباشر."
+                )
+                allow_fallback = _env('DB_ALLOW_SQLITE_FALLBACK', default='0') == '1'
+                if allow_fallback:
+                    logger.critical("🚨 " + hint)
+                    logger.critical("⚠️ DB_ALLOW_SQLITE_FALLBACK=1 → سيتم العمل على SQLite مؤقتاً، وأي بيانات جديدة ستُفقد عند إعادة التشغيل.")
+                else:
+                    logger.critical("🚨 " + hint)
+                    logger.critical("للسماح بالعمل على SQLite مؤقتاً: DB_ALLOW_SQLITE_FALLBACK=1")
+                    raise RuntimeError(hint) from last_err
         else:
-            self.is_sqlite = True
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            self.db_name = os.path.join(script_dir, 'channels.db')
-            logger.info(f"📁 تم تفعيل وضع قاعدة البيانات المحلية SQLite ({self.db_name}).")
+            logger.warning("⚠️ لم يتم ضبط DATABASE_URL — سيتم استخدام SQLite محلياً.")
+            logger.warning(f"📁 مسار قاعدة البيانات: {self.db_name}")
+            logger.warning("⚠️ على الاستضافة (Render) هذا يعني فقدان البيانات عند كل إعادة تشغيل! استعمل DATABASE_URL أو قرصاً دائماً (DATA_DIR).")
+
         self.init_db()
+        self._startup_self_test()
+
+    def _sqlite_path(self) -> str:
+        """مسار SQLite: يدعم قرص Render الدائم عبر DATA_DIR."""
+        data_dir = _env('DATA_DIR', 'DB_DIR', 'PERSISTENT_DIR', default='')
+        base = data_dir if data_dir else os.path.dirname(os.path.abspath(__file__))
+        try:
+            os.makedirs(base, exist_ok=True)
+        except Exception:
+            base = os.path.dirname(os.path.abspath(__file__))
+        return os.path.join(base, 'channels.db')
 
     def get_connection(self):
         """إنشاء اتصال بقاعدة البيانات المناسبة للبيئة الحالية"""
         if self.is_sqlite:
-            return sqlite3.connect(self.db_name)
-        else:
-            return psycopg2.connect(self.database_url)
+            conn = sqlite3.connect(self.db_name, timeout=30)
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                conn.execute("PRAGMA busy_timeout=30000")
+            except Exception:
+                pass
+            return conn
+        if self._pg_pool is None:
+            raise RuntimeError("PostgreSQL pool is not initialized")
+        return _PooledConnection(self, self._pg_pool.getconn())
 
-    def execute_query(self, query: str, params: tuple = (), fetch: bool = False):
+    @staticmethod
+    def _is_transient_error(err) -> bool:
+        """هل الخطأ عابر (شبكة / انقطاع اتصال) ويستحق إعادة المحاولة؟"""
+        if isinstance(err, (sqlite3.OperationalError, sqlite3.DatabaseError)):
+            m = str(err).lower()
+            return any(k in m for k in ("locked", "busy", "unable to open", "disk i/o"))
+        m = str(err).lower()
+        return any(k in m for k in (
+            "ssl connection has been closed", "server closed the connection",
+            "connection already closed", "connection not open", "could not connect",
+            "connection refused", "connection reset", "broken pipe", "eof detected",
+            "terminating connection", "too many connections", "timeout expired",
+            "timeout", "failed to connect", "lost connection",
+        ))
+
+    def _execute_once(self, query: str, params: tuple, fetch: bool, returning: bool):
         conn = None
         try:
             conn = self.get_connection()
             cursor = conn.cursor()
             q = self.adapt_query(query) if self.is_sqlite else query
+            if self.is_sqlite and returning:
+                q = re.sub(r'\s*RETURNING\s+\w+', '', q, flags=re.IGNORECASE)
             cursor.execute(q, params)
-            if fetch:
+            if returning:
+                result = cursor.lastrowid if self.is_sqlite else (cursor.fetchone() or [None])[0]
+            elif fetch:
                 result = cursor.fetchall()
-                conn.commit()
-                return result
             else:
-                conn.commit()
-                return True
-        except Exception as e:
-            logger.error(f"خطأ في قاعدة البيانات: {e}")
-            if conn:
+                result = True
+            try:
+                cursor.close()
+            except Exception:
+                pass
+            conn.commit()
+            return result
+        except Exception:
+            if conn is not None:
                 try:
                     conn.rollback()
                 except Exception:
                     pass
-            return False
+                if hasattr(conn, 'discard'):
+                    try:
+                        conn.discard()
+                    except Exception:
+                        pass
+            raise
         finally:
-            if conn:
+            if conn is not None:
                 try:
                     conn.close()
                 except Exception:
                     pass
+
+    def _run(self, query: str, params: tuple = (), fetch: bool = False, returning: bool = False):
+        last_err = None
+        for attempt in range(1, self.RETRY_ON_DB_ERROR + 1):
+            try:
+                return self._execute_once(query, params, fetch, returning)
+            except Exception as e:
+                last_err = e
+                if attempt < self.RETRY_ON_DB_ERROR and self._is_transient_error(e):
+                    logger.warning(f"↻ إعادة محاولة قاعدة البيانات ({attempt}/{self.RETRY_ON_DB_ERROR - 1}): {e}")
+                    time.sleep(0.4 * attempt)
+                    continue
+                break
+        logger.error(f"❌ خطأ في قاعدة البيانات: {last_err}")
+        return None
+
+    def execute_query(self, query: str, params: tuple = (), fetch: bool = False):
+        result = self._run(query, params, fetch=fetch, returning=False)
+        if result is None and fetch:
+            return False
+        return result
 
     def execute_returning(self, query: str, params: tuple = ()):
         """تنفيذ INSERT وإرجاع الـ id الجديد في كلا الوضعين"""
-        conn = None
+        return self._run(query, params, fetch=False, returning=True)
+
+    def _startup_self_test(self):
+        """تأكيد عملي أن الكتابة/القراءة تعمل فعلاً (يكشف فوراً أي قاعدة مؤقتة)."""
         try:
-            conn = self.get_connection()
-            cursor = conn.cursor()
+            stamp = str(int(time.time()))
+            self.set_setting('db_startup_probe', stamp)
+            read_back = self.get_setting('db_startup_probe')
+            counts = {}
+            for table in ("channels", "admins", "listing_requests", "sent_messages"):
+                rows = self.execute_query(f'SELECT COUNT(*) FROM {table}', fetch=True)
+                counts[table] = rows[0][0] if rows else "?"
+            self.db_mode = "PostgreSQL (Supabase)" if not self.is_sqlite else f"SQLite ({self.db_name})"
+            ok = (read_back == stamp)
+            logger.info(f"🧪 اختبار قاعدة البيانات {'ناجح ✅' if ok else 'غير مؤكد ⚠️'} | الوضع: {self.db_mode} | {counts}")
             if self.is_sqlite:
-                q = self.adapt_query(query)
-                q_no_ret = re.sub(r'\s*RETURNING\s+\w+', '', q, flags=re.IGNORECASE)
-                cursor.execute(q_no_ret, params)
-                conn.commit()
-                return cursor.lastrowid
-            else:
-                cursor.execute(query, params)
-                res = cursor.fetchone()
-                conn.commit()
-                return res[0] if res else None
+                logger.warning("⚠️ تنبيه: أنت على SQLite — البيانات غير دائمة إن كانت الاستضافة بلا قرص دائم.")
         except Exception as e:
-            logger.error(f"خطأ في execute_returning: {e}")
-            if conn:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-            return None
-        finally:
-            if conn:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+            logger.error(f"❌ فشل اختبار قاعدة البيانات: {e}")
+
 
     def init_db(self):
-        conn = None
-        try:
-            conn = self.get_connection()
-            cursor = conn.cursor()
-            if self.is_sqlite:
-                self._init_sqlite_tables(cursor, conn)
-            else:
-                self._init_postgres_tables(cursor, conn)
-        except Exception as e:
-            logger.error(f"❌ خطأ في تهيئة قاعدة البيانات: {e}")
-            if conn:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-            raise
-        finally:
-            if conn:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+        last_err = None
+        for attempt in range(1, self.RETRY_ON_DB_ERROR + 1):
+            conn = None
+            try:
+                conn = self.get_connection()
+                cursor = conn.cursor()
+                if self.is_sqlite:
+                    self._init_sqlite_tables(cursor, conn)
+                else:
+                    self._init_postgres_tables(cursor, conn)
+                self._ensure_migrations(cursor, conn)
+                return
+            except Exception as e:
+                last_err = e
+                if conn:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                    if hasattr(conn, 'discard'):
+                        try:
+                            conn.discard()
+                        except Exception:
+                            pass
+                if attempt < self.RETRY_ON_DB_ERROR and self._is_transient_error(e):
+                    logger.warning(f"↻ إعادة محاولة تهيئة قاعدة البيانات ({attempt}): {e}")
+                    time.sleep(0.5 * attempt)
+                    continue
+                break
+            finally:
+                if conn:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+        logger.error(f"❌ خطأ في تهيئة قاعدة البيانات: {last_err}")
+        raise RuntimeError(f"تعذّر تهيئة قاعدة البيانات: {last_err}") from last_err
+
+    def _ensure_migrations(self, cursor, conn):
+        """إضافة الأعمدة/الجداول الجديدة لقواعد بيانات قديمة بدون فقدان أي بيانات."""
+        if self.is_sqlite:
+            cursor.execute("PRAGMA table_info(sent_messages)")
+            cols = {row[1] for row in cursor.fetchall()}
+            if 'deleted_by' not in cols:
+                cursor.execute("ALTER TABLE sent_messages ADD COLUMN deleted_by TEXT")
+                logger.info("🛠️ تمت إضافة العمود deleted_by إلى sent_messages (SQLite)")
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_sent_channel_msg ON sent_messages(channel_id, message_id)')
+        else:
+            cursor.execute("ALTER TABLE sent_messages ADD COLUMN IF NOT EXISTS deleted_by TEXT")
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_sent_channel_msg ON sent_messages(channel_id, message_id)')
+        conn.commit()
 
     def _init_sqlite_tables(self, cursor, conn):
         cursor.execute('''
@@ -281,7 +629,8 @@ class DatabaseManager:
             timestamp INTEGER,
             content TEXT,
             batch_id INTEGER,
-            is_deleted_early INTEGER DEFAULT 0
+            is_deleted_early INTEGER DEFAULT 0,
+            deleted_by TEXT
         )''')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_sent_batch ON sent_messages(batch_id)')
         cursor.execute('''
@@ -354,6 +703,15 @@ class DatabaseManager:
             last_reason TEXT
         )''')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_channel_strikes ON channel_strikes(channel_id)')
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS deletion_suppressions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_id TEXT NOT NULL,
+            message_id INTEGER NOT NULL,
+            actor TEXT,
+            created_at INTEGER
+        )''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_del_supp ON deletion_suppressions(channel_id, message_id)')
         cursor.execute('SELECT user_id FROM admins WHERE user_id = ?', (ADMIN_ID,))
         if not cursor.fetchone():
             now_epoch = int(time.time())
@@ -387,7 +745,8 @@ class DatabaseManager:
             timestamp BIGINT,
             content TEXT,
             batch_id BIGINT,
-            is_deleted_early INTEGER DEFAULT 0
+            is_deleted_early INTEGER DEFAULT 0,
+            deleted_by TEXT
         )''')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_sent_batch ON sent_messages(batch_id)')
         cursor.execute('''
@@ -460,6 +819,15 @@ class DatabaseManager:
             last_reason TEXT
         )''')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_channel_strikes ON channel_strikes(channel_id)')
+        cursor.execute('''
+        CREATE TABLE IF NOT EXISTS deletion_suppressions (
+            id SERIAL PRIMARY KEY,
+            channel_id TEXT NOT NULL,
+            message_id BIGINT NOT NULL,
+            actor TEXT,
+            created_at BIGINT
+        )''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_del_supp ON deletion_suppressions(channel_id, message_id)')
         cursor.execute('SELECT user_id FROM admins WHERE user_id = %s', (ADMIN_ID,))
         if not cursor.fetchone():
             now_epoch = int(time.time())
@@ -571,11 +939,13 @@ class DatabaseManager:
         since_24h = int(time.time()) - 86400
         min_del = int(time.time()) + 10
         return self.execute_query(
-            '''SELECT s.id, s.message_id, s.channel_id, s.batch_id, 
-                      COALESCE(sd.hours_duration, 0) as hours_duration
+            '''SELECT s.id, s.message_id, s.channel_id, s.batch_id,
+                      COALESCE(sd.hours_duration, 0) as hours_duration,
+                      s.timestamp
                FROM sent_messages s
                LEFT JOIN scheduled_deletions sd ON s.batch_id = sd.batch_id
                WHERE (s.is_deleted_early IS NULL OR s.is_deleted_early = 0)
+                 AND (s.deleted_by IS NULL OR s.deleted_by = '')
                  AND s.timestamp > %s
                  AND (sd.status IS NULL OR sd.status = 'pending')
                  AND (sd.delete_at IS NULL OR sd.delete_at > %s)
@@ -586,6 +956,86 @@ class DatabaseManager:
 
     def mark_sent_message_deleted_early(self, sent_id: int):
         self.execute_query('UPDATE sent_messages SET is_deleted_early = 1 WHERE id = %s', (sent_id,))
+
+    def claim_sent_message_deleted_early(self, sent_id: int) -> bool:
+        """
+        حجز ذري لاحتساب المخالفة: نسخة واحدة فقط تنجح (مهم عند تشغيل أكثر من نسخة على نفس القاعدة).
+        يعيد True إذا كانت هذه هي المرة الأولى التي يُحتسب فيها هذا المنشور.
+        """
+        conn = None
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            q = ('UPDATE sent_messages SET is_deleted_early = 1 '
+                 'WHERE id = %s AND (is_deleted_early IS NULL OR is_deleted_early = 0)')
+            if self.is_sqlite:
+                q = self.adapt_query(q)
+            cursor.execute(q, (sent_id,))
+            changed = cursor.rowcount
+            conn.commit()
+            return bool(changed and changed > 0)
+        except Exception as e:
+            logger.error(f"خطأ في حجز احتساب المخالفة: {e}")
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            return False
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    # ─────────────────────────────────────────────────────────────
+    # 🛡️ حماية الرادار من التحذيرات الكاذبة عند الحذف الإداري
+    # ─────────────────────────────────────────────────────────────
+    def suppress_deletion(self, channel_id: str, message_id: int, actor: str = "admin"):
+        """تسجيل أن هذا المنشور تم حذفه من طرف الإدارة، حتى لا يحسبه الرادار مخالفة."""
+        return self.execute_query(
+            'INSERT INTO deletion_suppressions (channel_id, message_id, actor, created_at) VALUES (%s, %s, %s, %s)',
+            (str(channel_id), int(message_id), str(actor), int(time.time()))
+        )
+
+    def get_recent_deletion_suppressions(self, hours: int = 48) -> set:
+        since = int(time.time()) - (hours * 3600)
+        rows = self.execute_query(
+            'SELECT channel_id, message_id FROM deletion_suppressions WHERE created_at >= %s',
+            (since,), fetch=True
+        ) or []
+        return {(str(ch), int(mid)) for ch, mid in rows}
+
+    def is_deletion_suppressed(self, channel_id: str, message_id: int) -> bool:
+        rows = self.execute_query(
+            'SELECT 1 FROM deletion_suppressions WHERE channel_id = %s AND message_id = %s LIMIT 1',
+            (str(channel_id), int(message_id)), fetch=True
+        )
+        return bool(rows)
+
+    def prune_deletion_suppressions(self, days: int = 7):
+        since = int(time.time()) - (days * 86400)
+        return self.execute_query('DELETE FROM deletion_suppressions WHERE created_at < %s', (since,))
+
+    def mark_sent_message_deleted_by(self, row_id: int, actor: str = "admin") -> bool:
+        return self.execute_query(
+            'UPDATE sent_messages SET deleted_by = %s WHERE id = %s', (str(actor), row_id)
+        )
+
+    def get_sent_message_state(self, row_id: int):
+        """
+        حالة صف المنشور لحظة الفحص:
+        None  → الصف لم يبق موجوداً (تم الحذف/تنظيفه)
+        'admin' → حُذف إدارياً (لا يُحتسب مخالفة)
+        'ok'  → مازال مراقَباً
+        """
+        res = self.execute_query('SELECT deleted_by FROM sent_messages WHERE id = %s', (row_id,), fetch=True)
+        if not res:
+            return None
+        deleted_by = res[0][0]
+        return 'admin' if deleted_by else 'ok'
+
 
     def get_last_milestone(self, request_id: int) -> int:
         res = self.execute_query('SELECT last_milestone FROM listing_requests WHERE id = %s', (request_id,), fetch=True)
@@ -681,6 +1131,64 @@ class DatabaseManager:
 
     def delete_setting(self, key: str) -> bool:
         return self.execute_query('DELETE FROM bot_settings WHERE key = %s', (key,))
+
+    def try_claim_lock(self, key: str, stale_seconds: int) -> bool:
+        """
+        حجز قفل ذرّي (Atomic) في قاعدة البيانات — العملية كلها INSERT/UPDATE واحدة.
+
+        يعيد True فقط إذا لم تكن هناك نسخة نشطة أخرى تملك القفل، أو كانت نبضتها
+        أقدم من stale_seconds (أي أن النسخة القديمة ماتت/أُغلقت).
+        هذا هو ما يمنع نسختين من استقبال نفس البوت فيظهر خطأ 409 Conflict.
+        """
+        now = int(time.time())
+        threshold = now - max(1, int(stale_seconds))
+        conn = None
+        cursor = None
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            if self.is_sqlite:
+                query = (
+                    'INSERT INTO bot_settings (key, value) VALUES (?, ?) '
+                    'ON CONFLICT(key) DO UPDATE SET value = excluded.value '
+                    'WHERE CAST(bot_settings.value AS INTEGER) < ?'
+                )
+                params = (key, str(now), threshold)
+            else:
+                query = (
+                    'INSERT INTO bot_settings (key, value) VALUES (%s, %s) '
+                    'ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value '
+                    'WHERE CAST(bot_settings.value AS BIGINT) < %s'
+                )
+                params = (key, str(now), threshold)
+            cursor.execute(query, params)
+            changed = cursor.rowcount or 0
+            conn.commit()
+            return changed > 0
+        except Exception as e:
+            logger.error(f"خطأ في حجز قفل التشغيل: {e}")
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            if hasattr(conn, 'discard'):
+                try:
+                    conn.discard()
+                except Exception:
+                    pass
+            # في حال خطأ غير متوقع في القفل: لا نمنع البوت من العمل
+            return True
+        finally:
+            if conn:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def is_admin(self, user_id: int = None, username: str = None) -> bool:
         """التحقق من كون المستخدم مشرفاً عبر user_id أو username"""
@@ -855,11 +1363,16 @@ class DatabaseManager:
         )
 
     def new_broadcast_batch_id(self) -> int:
-        result = self.execute_query(
-            'SELECT COALESCE(MAX(batch_id), 0) + 1 FROM sent_messages',
-            fetch=True
-        )
-        return result[0][0] if result else 1
+        """رقم دفعة فريد — آمن حتى مع تشغيل عدة نسخ على نفس قاعدة البيانات."""
+        candidate = int(time.time() * 1000)
+        result = self.execute_query('SELECT COALESCE(MAX(batch_id), 0) FROM sent_messages', fetch=True)
+        current_max = 0
+        if result and result[0][0]:
+            try:
+                current_max = int(result[0][0])
+            except Exception:
+                current_max = 0
+        return candidate if candidate > current_max else current_max + 1
 
     def get_recent_broadcasts(self, limit: int = 10) -> List[Tuple]:
         return self.execute_query(
@@ -1237,6 +1750,36 @@ def check_all_channels_milestones():
             logger.warning(f"خطأ أثناء فحص إنجاز القناة {req[4]}: {e}")
     return celebrated_count
 
+def _remove_published_rows(rows, actor: str = "admin"):
+    """
+    حذف المنشورات المنشورة من القنوات بطريقة آمنة ومتزامنة.
+
+    ⚠️ الترتيب مقصود:
+      1) تسجيل الحذف في قاعدة البيانات (suppression + deleted_by)
+      2) الحذف الفعلي من تيليجرام
+      3) تنظيف الصف من جدول المنشورات
+    بهذا لا يستطيع رادار كشف الغش أن يحسب الحذف الإداري مخالفة على صاحب القناة،
+    حتى لو صادف أن الرادار كان يفحص في نفس اللحظة.
+    """
+    deleted = 0
+    failed = 0
+    for row in rows:
+        row_id, mid, ch_id = row[0], row[1], row[2]
+        with DELETION_LOCK:
+            try:
+                db.suppress_deletion(ch_id, mid, actor)
+                db.mark_sent_message_deleted_by(row_id, actor)
+            except Exception as e:
+                logger.warning(f"تعذر تسجيل الحذف الإداري ({ch_id}/{mid}): {e}")
+            ok = delete_message_from_channel(ch_id, mid)
+            db.delete_message_from_db(row_id)
+        if ok:
+            deleted += 1
+        else:
+            failed += 1
+    return deleted, failed
+
+
 def check_and_execute_scheduled_deletions():
     """فحص دوري لحذف المنشورات المؤقتة التي انتهت مدتها المحددة"""
     expired_list = db.get_expired_scheduled_deletions()
@@ -1251,12 +1794,7 @@ def check_and_execute_scheduled_deletions():
         failed_count = 0
         
         if rows:
-            for row_id, mid, ch_id, _name in rows:
-                if delete_message_from_channel(ch_id, mid):
-                    deleted_count += 1
-                else:
-                    failed_count += 1
-                db.delete_message_from_db(row_id)
+            deleted_count, failed_count = _remove_published_rows(rows, actor="auto_schedule")
         
         db.mark_scheduled_deletion_done(sched_id)
         logger.info(f"⏱️ تم تنفيذ الحذف التلقائي للمنشور المؤقت (دفعة #{batch_id}): {deleted_count} نجح، {failed_count} فشل.")
@@ -1279,138 +1817,200 @@ def check_and_execute_scheduled_deletions():
         )
         send_notification_to_requests_group_or_admins(notify_text)
 
-def check_if_message_deleted(channel_id: str, message_id: int) -> bool:
-    """فحص صامت وشامل للتحقق مما إذا كان المنشور قد تم حذفه من القناة دون تثبيت إطلاقاً ودون أي أثر"""
+
+def probe_channel_message(channel_id: str, message_id: int) -> str:
+    """
+    فحص وجود منشور داخل القناة بهدوء (بدون إزعاج وبدون تثبيت):
+      'ok'        → المنشور مازال موجوداً
+      'deleted'   → المنشور محذوف فعلاً
+      'no_rights' → البوت طُرد أو فُقدت صلاحياته (ليست مخالفة صاحب القناة)
+      'unknown'   → خطأ غير حاسم (لا يُحتسب مخالفة)
+    """
     try:
         bot.edit_message_reply_markup(chat_id=channel_id, message_id=message_id, reply_markup=None)
-        return False  # الرسالة موجودة
+        return "ok"
     except Exception as e:
         err_str = str(e).lower()
-        # حالات تدل على أن الرسالة محذوفة 100%
         if any(w in err_str for w in [
             "message to edit not found",
             "message not found",
-            "chat not found",
             "message_id_invalid",
-            "wrong message_id"
+            "wrong message_id",
         ]):
-            return True
-        # حالات تدل على أن البوت تم طرده أو سحب صلاحياته
+            return "deleted"
         if any(w in err_str for w in [
             "bot was kicked",
             "not a member",
             "chat admin required",
             "have no rights",
-            "not enough rights"
+            "not enough rights",
+            "need administrator rights",
+            "bot is not a member",
         ]):
-            return True
-        # حالات تدل على أن الرسالة موجودة (مثل: الرسالة لم تتغير أو رسالة محولة)
-        if any(w in err_str for w in [
-            "message is not modified",
-            "message can't be edited",
-            "cannot be edited",
-            "message to edit not modified"
-        ]):
-            return False
-            
-        return False
+            return "no_rights"
+        return "unknown"
+
+
+def check_if_message_deleted(channel_id: str, message_id: int) -> bool:
+    """(متوافق مع الكود القديم) True فقط عندما يكون الحذف مؤكداً."""
+    return probe_channel_message(channel_id, message_id) == "deleted"
+
+
+def _warn_missing_rights(channel_id: str):
+    """تنبيه الإدارة أن البوت فقد صلاحياته في قناة (مرة كل 12 ساعة لكل قناة)."""
+    key = f"radar_rights_warn:{channel_id}"
+    try:
+        last = db.get_setting(key)
+        if last and (time.time() - int(last)) < 12 * 3600:
+            return
+        db.set_setting(key, str(int(time.time())))
+    except Exception:
+        pass
+    clean = html.escape(str(channel_id).lstrip('@'))
+    text = (
+        "<blockquote>\n"
+        "🛠️ <b>تنبيه صيانة — البوت لا يستطيع قراءة منشوره في قناة</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"📢 <b>القناة:</b> <code>{clean}</code>\n"
+        "🚫 <b>السبب:</b> البوت ليس مشرفاً أو صلاحية التعديل/الحذف مسحوبة.\n"
+        "<b>لن يتم احتساب أي إنذار على صاحب القناة بسبب هذا الوضع.</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "👇 أعد إضافة البوت مشرفاً مع صلاحيات النشر والحذف.\n"
+        "</blockquote>\n\n"
+        "👨‍💻 <b>إدارة المنصة:</b> @NEXUS_IMTIAZ"
+    )
+    try:
+        send_notification_to_requests_group_or_admins(text)
+    except Exception as e:
+        logger.warning(f"تعذر إرسال تنبيه الصلاحيات: {e}")
+
 
 def run_anti_cheat_check() -> int:
-    """رادار كشف الغش: يفحص المنشورات المنشورة في القنوات ويتأكد من عدم حذفها قبل انقضاء الموعد"""
+    """
+    رادار كشف الغش: يفحص المنشورات المنشورة ويتأكد من عدم حذفها قبل انقضاء الموعد.
+    محصّن ضد التحذيرات الكاذبة:
+      • يتجاهل أي منشور سجّلت الإدارة/الجدولة حذفه.
+      • يعيد التحقق من قاعدة البيانات لحظة اتخاذ القرار (وليس من اللقطة القديمة).
+      • لا يعاقب على سحب صلاحيات البوت.
+    """
     active_msgs = db.get_active_broadcast_messages_for_monitoring()
     if not active_msgs:
         return 0
-    
-    from datetime import datetime
+
     now = datetime.now()
     day_name = DAYS_AR.get(now.weekday(), "")
     date_str = f"{day_name} {now.strftime('%Y-%m-%d')}"
     time_str = now.strftime("%H:%M:%S")
     detected_count = 0
 
-    for msg_row in active_msgs:
-        sent_id, message_id, channel_id, batch_id, hours_duration = msg_row
-        
-        is_deleted = check_if_message_deleted(channel_id, message_id)
-        if is_deleted:
-            detected_count += 1
-            # 1. وضع علامة لعدم تكرار الإنذار لنفس المنشور
-            db.mark_sent_message_deleted_early(sent_id)
-            
-            # 2. زيادة عدد الإنذارات للقناة في قاعدة البيانات
-            new_strikes = db.add_channel_strike(channel_id, reason="حذف منشور المجلد قبل انتهاء الوقت")
-            
-            clean_chan = channel_id.lstrip('@')
-            safe_channel = html.escape(channel_id)
-            owner_user_id = db.get_channel_owner_id(channel_id)
-            
-            # 3. إشعار تحذيري لصاحب القناة في الخاص
-            if owner_user_id:
-                user_warn_text = (
-                    "<blockquote>\n"
-                    "⚠️ <b>تحذير رسمي — رادار كشف حذف المنشورات!</b>\n"
-                    "━━━━━━━━━━━━━━━━━━\n"
-                    f"📢 <b>القناة:</b> <code>{safe_channel}</code>\n"
-                    f"⚠️ <b>الإنذار رقم:</b> <b>({new_strikes}/5)</b>\n"
-                    "━━━━━━━━━━━━━━━━━━\n"
-                    "🚨 <b>لقد تم رصد حذف منشور المجلد الموحد من قناتك قبل انتهاء فترة النشر المحددة!</b>\n\n"
-                    "📌 <b>تذكير بالقوانين:</b> يجب إبقاء منشور المجلد طيلة فترة الدعم لضمان استفادة ونمو جميع القنوات المشتركة.\n"
-                    "⚠️ <b>تنبيه:</b> عند الوصول إلى 5 إنذارات، سيتم نفي واستبعاد قناتك نهائياً وحظرها من المشاركة في المجلدات.\n"
-                    "</blockquote>\n\n"
-                    "👨‍💻 <b>إدارة المنصة:</b> @NEXUS_IMTIAZ"
-                )
-                try:
-                    bot.send_message(owner_user_id, user_warn_text, parse_mode='HTML')
-                except Exception as e:
-                    logger.warning(f"تعذر إرسال الإنذار للمستخدم {owner_user_id}: {e}")
+    suppressed = db.get_recent_deletion_suppressions(hours=48)
+    if not isinstance(suppressed, (set, list, tuple)):
+        suppressed = set()
+    suppressed = set(suppressed)
 
-            # 4. إرسال إشعار في قروب الطلبات
-            if new_strikes >= 5:
-                # بلوغ 5 إنذارات -> يظهر زر نفي واستبعاد القناة
-                group_alert = (
-                    "<blockquote>\n"
-                    "🚨 <b>إنذار أقصى — قناة بلغت الحد الأقصى من المخالفات!</b>\n"
-                    "━━━━━━━━━━━━━━━━━━\n"
-                    f"📢 <b>القناة:</b> <code>{safe_channel}</code>\n"
-                    f"⚠️ <b>سجل المخالفات:</b> <b>5 إنذارات من أصل 5 (5/5) ❌</b>\n"
-                    f"⏱️ <b>السبب:</b> <b>تكرار حذف منشورات المجلد قبل انقضاء الموعد 5 مرات.</b>\n"
-                    f"📅 <b>توقيت الرصد:</b> <b>{date_str} {time_str}</b>\n"
-                    "━━━━━━━━━━━━━━━━━━\n"
-                    "👇 <b>يمكنك الآن نفي واستبعاد القناة وحظرها نهائياً بضغطة زر:</b>\n"
-                    "</blockquote>\n\n"
-                    "👨‍💻 <b>إدارة المنصة:</b> @NEXUS_IMTIAZ"
-                )
-                markup = types.InlineKeyboardMarkup(row_width=1)
-                markup.add(
-                    types.InlineKeyboardButton("⛔ نفي واستبعاد القناة وحظرها نهائياً", callback_data=f"adm_ban_strike_channel_{clean_chan}"),
-                    types.InlineKeyboardButton("👁️ معاينة القناة", url=f"https://t.me/{clean_chan}"),
-                    types.InlineKeyboardButton("🔄 تصفير الإنذارات والسماح لها", callback_data=f"adm_reset_strikes_{clean_chan}")
-                )
-            else:
-                # إنذار عادي أقل من 5
-                group_alert = (
-                    "<blockquote>\n"
-                    "🕵️‍♂️ <b>رادار كشف الغش — رصد حذف منشور مبكراً!</b>\n"
-                    "━━━━━━━━━━━━━━━━━━\n"
-                    f"📢 <b>القناة:</b> <code>{safe_channel}</code>\n"
-                    f"⚠️ <b>الإنذار الحالي:</b> <b>({new_strikes}/5)</b>\n"
-                    f"⏱️ <b>المخالفة:</b> <b>حذف منشور المجلد قبل الموعد المحدد.</b>\n"
-                    f"📅 <b>التوقيت:</b> <b>{date_str} {time_str}</b>\n"
-                    "━━━━━━━━━━━━━━━━━━\n"
-                    "📩 <b>تم إرسال تحذير رسمي لصاحب القناة في الخاص.</b>\n"
-                    "</blockquote>\n\n"
-                    "👨‍💻 <b>إدارة المنصة:</b> @NEXUS_IMTIAZ"
-                )
-                markup = types.InlineKeyboardMarkup(row_width=2)
-                markup.add(
-                    types.InlineKeyboardButton("👁️ معاينة القناة", url=f"https://t.me/{clean_chan}"),
-                    types.InlineKeyboardButton("💬 مراسلة المالك", callback_data=f"adm_contact_actor_{owner_user_id}" if owner_user_id else f"adm_contact_actor_{ADMIN_ID}")
-                )
-            
-            send_notification_to_requests_group_or_admins(group_alert, markup=markup)
-            logger.warning(f"🕵️‍♂️ تم رصد حذف مبكر في {channel_id} (إنذار {new_strikes}/5)")
-            
-        time.sleep(0.5)
+    for msg_row in active_msgs:
+        sent_id, message_id, channel_id, batch_id, hours_duration, sent_at = msg_row
+
+        # 1) تجاهل المنشورات الطازجة جداً (قد تكون قيد النشر/التعديل)
+        if sent_at and (time.time() - int(sent_at)) < RADAR_GRACE_SECONDS:
+            continue
+
+        # 2) تجاهل ما حذفته الإدارة أو الجدولة تلقائياً
+        if (str(channel_id), int(message_id)) in suppressed:
+            continue
+
+        with DELETION_LOCK:
+            # 3) الصف يجب أن يكون مازال موجوداً وغير مُعلَّم كحذف إداري
+            if db.get_sent_message_state(sent_id) != 'ok':
+                continue
+
+            probe = probe_channel_message(channel_id, message_id)
+            if probe != "deleted":
+                if probe == "no_rights":
+                    _warn_missing_rights(channel_id)
+                continue
+
+            # 4) تأكيد أخير بعد الفحص (حماية من التزامن مع الحذف اليدوي)
+            if (db.is_deletion_suppressed(channel_id, message_id)
+                    or db.get_sent_message_state(sent_id) != 'ok'):
+                continue
+
+            # 5) حجز ذري: نسخة واحدة فقط تحتسب المخالفة
+            if not db.claim_sent_message_deleted_early(sent_id):
+                continue
+
+            detected_count += 1
+            new_strikes = db.add_channel_strike(channel_id, reason="حذف منشور المجلد قبل انتهاء الوقت")
+
+        clean_chan = channel_id.lstrip('@')
+        safe_channel = html.escape(channel_id)
+        owner_user_id = db.get_channel_owner_id(channel_id)
+
+        # إشعار تحذيري لصاحب القناة في الخاص
+        if owner_user_id:
+            user_warn_text = (
+                "<blockquote>\n"
+                "⚠️ <b>تحذير رسمي — رادار كشف حذف المنشورات!</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                f"📢 <b>القناة:</b> <code>{safe_channel}</code>\n"
+                f"⚠️ <b>الإنذار رقم:</b> <b>({new_strikes}/5)</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "🚨 <b>لقد تم رصد حذف منشور المجلد الموحد من قناتك قبل انتهاء فترة النشر المحددة!</b>\n\n"
+                "📌 <b>تذكير بالقوانين:</b> يجب إبقاء منشور المجلد طيلة فترة الدعم لضمان استفادة ونمو جميع القنوات المشتركة.\n"
+                "⚠️ <b>تنبيه:</b> عند الوصول إلى 5 إنذارات، سيتم نفي واستبعاد قناتك نهائياً وحظرها من المشاركة في المجلدات.\n"
+                "</blockquote>\n\n"
+                "👨‍💻 <b>إدارة المنصة:</b> @NEXUS_IMTIAZ"
+            )
+            try:
+                bot.send_message(owner_user_id, user_warn_text, parse_mode='HTML')
+            except Exception as e:
+                logger.warning(f"تعذر إرسال الإنذار للمستخدم {owner_user_id}: {e}")
+
+        # إشعار في قروب الطلبات
+        if new_strikes >= 5:
+            group_alert = (
+                "<blockquote>\n"
+                "🚨 <b>إنذار أقصى — قناة بلغت الحد الأقصى من المخالفات!</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                f"📢 <b>القناة:</b> <code>{safe_channel}</code>\n"
+                f"⚠️ <b>سجل المخالفات:</b> <b>5 إنذارات من أصل 5 (5/5) ❌</b>\n"
+                f"⏱️ <b>السبب:</b> <b>تكرار حذف منشورات المجلد قبل انقضاء الموعد 5 مرات.</b>\n"
+                f"📅 <b>توقيت الرصد:</b> <b>{date_str} {time_str}</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "👇 <b>يمكنك الآن نفي واستبعاد القناة وحظرها نهائياً بضغطة زر:</b>\n"
+                "</blockquote>\n\n"
+                "👨‍💻 <b>إدارة المنصة:</b> @NEXUS_IMTIAZ"
+            )
+            markup = types.InlineKeyboardMarkup(row_width=1)
+            markup.add(
+                types.InlineKeyboardButton("⛔ نفي واستبعاد القناة وحظرها نهائياً", callback_data=f"adm_ban_strike_channel_{clean_chan}"),
+                types.InlineKeyboardButton("👁️ معاينة القناة", url=f"https://t.me/{clean_chan}"),
+                types.InlineKeyboardButton("🔄 تصفير الإنذارات والسماح لها", callback_data=f"adm_reset_strikes_{clean_chan}")
+            )
+        else:
+            group_alert = (
+                "<blockquote>\n"
+                "🕵️‍♂️ <b>رادار كشف الغش — رصد حذف منشور مبكراً!</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                f"📢 <b>القناة:</b> <code>{safe_channel}</code>\n"
+                f"⚠️ <b>الإنذار الحالي:</b> <b>({new_strikes}/5)</b>\n"
+                f"⏱️ <b>المخالفة:</b> <b>حذف منشور المجلد قبل الموعد المحدد.</b>\n"
+                f"📅 <b>التوقيت:</b> <b>{date_str} {time_str}</b>\n"
+                "━━━━━━━━━━━━━━━━━━\n"
+                "📩 <b>تم إرسال تحذير رسمي لصاحب القناة في الخاص.</b>\n"
+                "</blockquote>\n\n"
+                "👨‍💻 <b>إدارة المنصة:</b> @NEXUS_IMTIAZ"
+            )
+            markup = types.InlineKeyboardMarkup(row_width=2)
+            markup.add(
+                types.InlineKeyboardButton("👁️ معاينة القناة", url=f"https://t.me/{clean_chan}"),
+                types.InlineKeyboardButton("💬 مراسلة المالك", callback_data=f"adm_contact_actor_{owner_user_id}" if owner_user_id else f"adm_contact_actor_{ADMIN_ID}")
+            )
+
+        send_notification_to_requests_group_or_admins(group_alert, markup=markup)
+        logger.warning(f"🕵️‍♂️ تم رصد حذف مبكر في {channel_id} (إنذار {new_strikes}/5)")
+
+        time.sleep(0.3)
     return detected_count
 
 def run_milestones_checker_loop():
@@ -1430,7 +2030,7 @@ def run_milestones_checker_loop():
 
         try:
             # 2. رادار كشف الغش: يفحص المنشورات النشطة كل 30 ثانية (دورتين × 15 ثانية = 30 ثانية)
-            if counter % 2 == 0:
+            if counter % RADAR_EVERY_N_CYCLES == 0:
                 run_anti_cheat_check()
         except Exception as e:
             logger.error(f"خطأ في رادار كشف الغش: {e}")
@@ -1441,6 +2041,13 @@ def run_milestones_checker_loop():
                 check_all_channels_milestones()
         except Exception as e:
             logger.error(f"خطأ في دورة فحص إنجازات النمو: {e}")
+
+        try:
+            # 4. تنظيف سجل الحذف الإداري مرة كل ساعة (20 دورة × 3 دقائق لا، كل 240 دورة = ساعة)
+            if counter % 240 == 0 and counter:
+                db.prune_deletion_suppressions(SUPPRESSION_RETENTION_DAYS)
+        except Exception as e:
+            logger.error(f"خطأ في تنظيف سجل الحذف: {e}")
 
         counter += 1
         time.sleep(15)
@@ -2209,10 +2816,14 @@ def process_user_support_message(message):
         logger.error(f"خطأ في معالجة رسالة الدعم: {e}")
 
 def delete_message_from_channel(channel_id: str, message_id: int) -> bool:
+    """حذف رسالة من قناة (يعتبر "غير موجودة" نجاحاً حتى لا يفشل التنظيف بلا داعٍ)."""
     try:
         bot.delete_message(channel_id, message_id)
         return True
     except Exception as e:
+        err = str(e).lower()
+        if any(w in err for w in ("message to delete not found", "message not found")):
+            return True
         logger.error(f"فشل في حذف الرسالة من {channel_id}: {e}")
         return False
 
@@ -2693,6 +3304,7 @@ def handle_callback(call):
     user_id = call.from_user.id
     data = call.data or ""
     logger.info(f"طلب callback من user_id: {user_id}, username: {username}, callback_data: {data}")
+    print(f"[CALLBACK] {user_id} ({username}) -> {data}", flush=True)
 
     if data.startswith("u_"):
         handle_user_callback(call)
@@ -3850,15 +4462,13 @@ def delete_last_post_from_channel(chat_id, channel_id: str):
         bot.send_message(chat_id, f"📭 لا يوجد منشور لحذفه في <code>{html.escape(channel_id)}</code>", parse_mode='HTML')
         return
 
-    row_id, mid, ch_id = row
-    ok = delete_message_from_channel(ch_id, mid)
-    db.delete_message_from_db(row_id)
-    if ok:
-        bot.send_message(chat_id, f"✅ تم حذف المنشور من <code>{html.escape(ch_id)}</code>", parse_mode='HTML')
+    deleted, failed = _remove_published_rows([row], actor="admin")
+    if deleted:
+        bot.send_message(chat_id, f"✅ تم حذف المنشور من <code>{html.escape(channel_id)}</code>", parse_mode='HTML')
     else:
         bot.send_message(
             chat_id,
-            f"⚠️ تعذر حذف المنشور من القناة، وتمت إزالته من السجل: <code>{html.escape(ch_id)}</code>",
+            f"⚠️ تعذر حذف المنشور من القناة، وتمت إزالته من السجل: <code>{html.escape(channel_id)}</code>",
             parse_mode='HTML'
         )
 
@@ -3874,14 +4484,11 @@ def delete_last_post_from_all_channels(chat_id, menu_msg_id):
         bot.send_message(chat_id, "📭 لا يوجد منشور لحذفه.")
         return
 
-    deleted = 0
-    failed = 0
-    for row_id, mid, ch_id, _name in rows:
-        if delete_message_from_channel(ch_id, mid):
-            deleted += 1
-        else:
-            failed += 1
-        db.delete_message_from_db(row_id)
+    deleted, failed = _remove_published_rows(rows, actor="admin")
+    try:
+        db.cancel_scheduled_deletion(batch_id=batch_id)
+    except Exception:
+        pass
 
     try:
         bot.delete_message(chat_id, menu_msg_id)
@@ -3891,6 +4498,7 @@ def delete_last_post_from_all_channels(chat_id, menu_msg_id):
     result_text = f"✅ تم حذف المنشور من <b>{deleted}</b> قناة"
     if failed:
         result_text += f"\n⚠️ فشل الحذف من <b>{failed}</b> قناة"
+    result_text += "\n🛡️ <i>تم تسجيل الحذف كإجراء إداري — لن يصدر أي إنذار لأصحاب القنوات.</i>"
     bot.send_message(chat_id, result_text, parse_mode='HTML')
 
 
@@ -4018,8 +4626,53 @@ def process_edit_message(message, pending_id: int):
     else:
         bot.send_message(message.chat.id, "❌ حدث خطأ في حفظ الرسالة")
 
+# ─────────────────────────────────────────────────────────────
+# 🔒 قفل تشغيل نسخة واحدة من نفس البوت (يمنع تكرار الردود/الإنذارات
+# عند تشغيل عدة Workers أو إعادة النشر على Render)
+# ─────────────────────────────────────────────────────────────
+POLLER_LOCK_KEY = "poller_lock:" + hashlib.sha256(TOKEN.encode('utf-8')).hexdigest()[:12]
+
+
+def claim_poller_slot(stale_seconds: int = None) -> bool:
+    """
+    حجز خانة التشغيل لهذا التوكن بشكل ذرّي (Atomic):
+    نسخة واحدة فقط تنجح حتى لو بدأت نسختان في نفس اللحظة.
+    """
+    if stale_seconds is None:
+        stale_seconds = POLLER_LOCK_STALE_SECONDS
+    return db.try_claim_lock(POLLER_LOCK_KEY, stale_seconds)
+
+
+def poller_heartbeat_loop():
+    """تحديث نبضة النسخة النشطة كل 30 ثانية (أقل من مدة انتهاء القفل)."""
+    while True:
+        try:
+            db.set_setting(POLLER_LOCK_KEY, str(int(time.time())))
+        except Exception:
+            pass
+        time.sleep(30)
+
+
+def acquire_poller_slot_blocking() -> bool:
+    """انتظار تحرير القفل (نسخة قديمة تُغلق) ثم التشغيل — أو التشغيل فوراً في وضع التعدد."""
+    if _env('MULTI_INSTANCE', default='0') == '1':
+        logger.warning("⚠️ MULTI_INSTANCE=1 → تم تعطيل قفل النسخة الواحدة (تأكد أن لكل نسخة توكن مختلف).")
+        return True
+    warned = False
+    while not claim_poller_slot():
+        if not warned:
+            logger.info("⏳ نسخة أخرى من نفس البوت تشغّل الاستقبال حالياً — انتظار تحرير القفل...")
+            warned = True
+        time.sleep(5)
+    logger.info(f"🔒 تم حجز قفل التشغيل ({POLLER_LOCK_KEY}).")
+    return True
+
+
 # تشغيل البوت وخادم ويب Flask للاستضافة 24/7
 def start_bot_polling():
+    acquire_poller_slot_blocking()
+    threading.Thread(target=poller_heartbeat_loop, daemon=True).start()
+
     logger.info("✅ البوت يعمل بنجاح (في خيط منفصل)...")
     try:
         threading.Thread(target=run_milestones_checker_loop, daemon=True).start()
@@ -4027,18 +4680,41 @@ def start_bot_polling():
     except Exception as e:
         logger.warning(f"تعذر تشغيل خيط الخلفية: {e}")
 
+    conflict_streak = 0
     while True:
         try:
-            bot.infinity_polling(timeout=20, long_polling_timeout=20, restart_on_change=False)
+            bot.delete_webhook(drop_pending_updates=False)
+            bot.infinity_polling(timeout=20, long_polling_timeout=20, restart_on_change=False,
+                                 allowed_updates=["message", "callback_query", "chat_member", "my_chat_member"])
+            conflict_streak = 0
         except Exception as e:
-            logger.warning(f"⚠️ إعادة محاولة اتصال تلقائية مع خوادم التيليجرام: {e}")
-            time.sleep(3)
+            if _is_polling_conflict(e):
+                # 409 = نسخة أخرى تستقبل نفس البوت. لا نزعج الأونر/الزبون بأي رسالة،
+                # فقط انتظار متزايد ثم إعادة المحاولة بهدوء.
+                conflict_streak += 1
+                wait_s = min(60, 5 * conflict_streak)
+                logger.warning(
+                    f"⚠️ تعارض استقبال (409) — نسخة أخرى من نفس البوت تعمل الآن. "
+                    f"إعادة المحاولة بعد {wait_s} ثانية (المحاولة {conflict_streak})."
+                )
+            else:
+                wait_s = 3
+                logger.warning(f"⚠️ إعادة محاولة اتصال تلقائية مع خوادم التيليجرام: {e}")
+                try:
+                    bot.delete_webhook(drop_pending_updates=False)
+                except Exception:
+                    pass
+            time.sleep(wait_s)
 
 # إذا كانت Flask متوفرة ونعمل على خادم (أو تحت Gunicorn)
 if HAS_FLASK:
     # بدء تشغيل خيوط البوت تلقائياً عند تحميل الكود لضمان عمله تحت Gunicorn
-    bot_thread = threading.Thread(target=start_bot_polling, daemon=True)
-    bot_thread.start()
+    if _env('RUN_BOT', default='1') == '1':
+        bot_thread = threading.Thread(target=start_bot_polling, daemon=True)
+        bot_thread.start()
+    else:
+        logger.info("ℹ️ RUN_BOT=0 → تم تعطيل تشغيل البوت (وضع خادم الويب فقط).")
+        bot_thread = None
 else:
     bot_thread = None
 
